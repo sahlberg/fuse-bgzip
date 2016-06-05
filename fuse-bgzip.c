@@ -27,6 +27,7 @@
 #define _FILE_OFFSET_BITS 64
 
 #include <dirent.h>
+#include <endian.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <fuse.h>
@@ -42,10 +43,13 @@
 
 #include <htslib/bgzf.h>
 #include <htslib/hts.h>
+#include <tdb.h>
+
+#define discard_const(ptr) ((void *)((intptr_t)(ptr)))
 
 #define LOG(...) {                          \
         if (logfile) { \
-            FILE *fh = fopen("/tmp/fuselog", "a+"); \
+            FILE *fh = fopen(logfile, "a+"); \
             fprintf(fh, "[BGZIP] "); \
             fprintf(fh, __VA_ARGS__); \
             fclose(fh); \
@@ -58,6 +62,8 @@ struct file {
 };
 
 static char *logfile;
+
+static struct tdb_context *tdb;
 
 /* descriptor for the underlying directory */
 static int dir_fd;
@@ -84,6 +90,18 @@ static int need_bgzip_uncompress(const char *file) {
         char stripped[PATH_MAX];
         char tmp[PATH_MAX];
         struct stat st;
+        TDB_DATA key, data;
+        uint8_t ret = 1;
+
+        LOG("NEED_BGZIP_UNCOMPRESS [%s]\n", file);
+        key.dptr = discard_const(file);
+        key.dsize = strlen(file);
+        data = tdb_fetch(tdb, key);
+        if (data.dptr) {
+                uint8_t val = data.dptr[0];
+                free(data.dptr);
+                return val;
+        }
 
         snprintf(stripped, PATH_MAX,"%s", file);
         if (strlen(stripped) > 4 &&
@@ -96,90 +114,25 @@ static int need_bgzip_uncompress(const char *file) {
         }
 
         if (fstatat(dir_fd, stripped, &st, AT_NO_AUTOMOUNT) == 0) {
-                return 0;
+                ret = 0;
+                goto finished;
         }
         snprintf(tmp, PATH_MAX, "%s.gz", stripped);
         if (fstatat(dir_fd, tmp, &st, AT_NO_AUTOMOUNT) != 0) {
-                return 0;
+                ret = 0;
+                goto finished;
         }
         snprintf(tmp, PATH_MAX, "%s.gz.gzi", stripped);
         if (fstatat(dir_fd, tmp, &st, AT_NO_AUTOMOUNT) != 0) {
-                return 0;
-        }
-        
-        return 1;
-}
-
-/* returns the size of the uncompressed file, or 0 if it could not be
- * determined.
- */
-static off_t get_unzipped_size(const char *path)
-{
-        BGZF *fh;
-        char cache[PATH_MAX];
-        char tmp[PATH_MAX];
-        int fd;
-        off_t pos = 0;
-        ssize_t count;
-        char buf[1024];
-        const char *ptr;
-
-        /* Create the full path to the cache file. */
-        ptr = strrchr(path, '/');
-        if (ptr) {
-                ptr++;
-        } else {
-                ptr = path;
-        }
-        snprintf(cache, PATH_MAX, "%s/%s.size", cache_path, ptr);
-
-        /* Try reading size from cache */
-        fd = open(cache, O_RDONLY);
-        if (fd >= 0) {
-                if (read(fd, &pos, sizeof(pos)) == sizeof(pos)) {
-                        close(fd);
-                        return pos;
-                }
-                close(fd);
+                ret = 0;
+                goto finished;
         }
 
-        snprintf(tmp, PATH_MAX, "%s.gz", path);
-        fd = openat(dir_fd, tmp, O_RDONLY);
-        if (fd == -1) {
-                return 0;
-        } 
-
-        fh = bgzf_dopen(fd, "ru");
-        if (fh == NULL) {
-                close(fd);
-                return 0;
-        }
-
-        while (1) {
-                count = bgzf_read(fh, buf, sizeof(buf));
-                if (count < 0) {
-                        bgzf_close(fh);
-                        return 0;
-                }
-                if (count == 0) {
-                        break;
-                }
-                pos += count;
-        }
-        bgzf_close(fh);
-
-        /* Write the size to cache */
-        fd = open(cache, O_CREAT|O_WRONLY, 0600);
-        if (fd == -1) {
-                return pos;
-        }
-        if (write(fd, &pos, sizeof(pos)) != sizeof(pos)) {
-                close(fd);
-                return pos;
-        }
-        close(fd);
-        
-        return pos;
+finished:
+        data.dptr = &ret;
+        data.dsize = 1;
+        tdb_store(tdb, key, data, TDB_REPLACE);
+        return ret;
 }
 
 static void copy_index_file(const char *path)
@@ -188,7 +141,7 @@ static void copy_index_file(const char *path)
         char tmp[PATH_MAX];
         char buf[1024];
         char *ptr;
-        
+
         in = openat(dir_fd, path, O_RDONLY);
         if (in == -1) {
                 return;
@@ -221,7 +174,7 @@ static void copy_index_file(const char *path)
                 write(out, buf, count);
         }
         close(in);
-        close(out);        
+        close(out);
 }
 
 static void load_index_file(BGZF *fh, const char *path)
@@ -230,7 +183,7 @@ static void load_index_file(BGZF *fh, const char *path)
         const char *ptr;
         int ret;
         struct stat st;
-        
+
         /* Create the full path to the index file. */
         ptr = strrchr(path, '/');
         if (ptr) {
@@ -243,11 +196,123 @@ static void load_index_file(BGZF *fh, const char *path)
         if (stat(tmp, &st) == -1 && errno == ENOENT) {
                 copy_index_file(path);
         }
-                
+
         ret = bgzf_index_load(fh, tmp, NULL);
         if (ret == -1) {
                 LOG("LOAD_INDEX_FILE [%s] %s\n", tmp, strerror(errno));
         }
+}
+
+/* returns the size of the uncompressed file, or 0 if it could not be
+ * determined.
+ */
+static off_t get_unzipped_size(const char *path)
+{
+        BGZF *fh;
+        char cache[PATH_MAX];
+        char tmp[PATH_MAX];
+        char index_file[PATH_MAX];
+        int fd;
+        off_t pos;
+        uint64_t start_pos;
+        ssize_t count;
+        char buf[4096];
+        const char *ptr;
+
+        /* Create the full path to the cache file. */
+        ptr = strrchr(path, '/');
+        if (ptr) {
+                ptr++;
+        } else {
+                ptr = path;
+        }
+        snprintf(cache, PATH_MAX, "%s/%s.size", cache_path, ptr);
+
+        /* Try reading size from cache */
+        fd = open(cache, O_RDONLY);
+        if (fd >= 0) {
+                if (read(fd, &pos, sizeof(pos)) == sizeof(pos)) {
+                        close(fd);
+                        return pos;
+                }
+                close(fd);
+        }
+
+        snprintf(tmp, PATH_MAX, "%s.gz", path);
+        fd = openat(dir_fd, tmp, O_RDONLY);
+        if (fd == -1) {
+                return 0;
+        } 
+
+        fh = bgzf_dopen(fd, "ru");
+        if (fh == NULL) {
+                close(fd);
+                return 0;
+        }
+        snprintf(index_file, PATH_MAX, "%s.gz.gzi", path);
+        load_index_file(fh, index_file);
+
+
+        /* Now we need to peek into the index file to find the uncompressed
+         * offset for the final gzip block of the index.
+         *
+         * The index file consists of
+         * +------------------------------+
+         * |            count             | 8 bytes
+         * +------------------------------+
+         * followed by count + 1 blocks of
+         * +------------------------------+
+         * |      compressed offset       | 8 bytes
+         * +------------------------------+
+         * |      uncompressed offset     | 8 bytes
+         * +------------------------------+
+         * So just reading the last 8 bytes id the index file will
+         * give us a good (and valid) starting offset for finding the EOF and
+         * uncompressed file size.
+         */
+        start_pos = 0;
+        snprintf(index_file, PATH_MAX, "%s/%s.gz.gzi", cache_path, ptr);
+
+        fd = open(index_file, O_RDONLY);
+        if (fd == -1) {
+                return 0;
+        }
+        read(fd, &start_pos, sizeof(start_pos));
+        start_pos = le64toh(start_pos);
+        pread(fd, &start_pos, 8, start_pos * 16);
+        start_pos = le64toh(start_pos);
+        close(fd);
+
+        /* Seek to the start of the final gzip block */
+        bgzf_useek(fh, start_pos, SEEK_SET);
+        pos = start_pos;
+
+        /* And start scanning for EOF */
+        while (1) {
+                count = bgzf_read(fh, buf, sizeof(buf));
+                if (count < 0) {
+                        bgzf_close(fh);
+                        return 0;
+                }
+                if (count == 0) {
+                        break;
+                }
+                pos += count;
+        }
+        bgzf_close(fh);
+
+        /* Write the size to cache */
+        fd = open(cache, O_CREAT|O_WRONLY, 0600);
+        if (fd == -1) {
+                return pos;
+        }
+        if (write(fd, &pos, sizeof(pos)) != sizeof(pos)) {
+                close(fd);
+                return pos;
+        }
+        close(fd);
+        
+        return pos;
 }
 
 static int fuse_bgzip_getattr(const char *path, struct stat *stbuf)
@@ -456,7 +521,8 @@ static struct fuse_operations bgzip_oper = {
 static void print_usage(char *name)
 {
         printf("Usage: %s [-?|--help] [-a|--allow-other] "
-               "[-m|--mountpoint=mountpoint] ", name);
+               "[-m|--mountpoint=mountpoint] "
+               "[-l|--logfile=logfile]", name);
         exit(0);
 }
 
@@ -529,5 +595,12 @@ int main(int argc, char *argv[])
         
         dir_fd = open(mnt, O_DIRECTORY);
         fuse_bgzip_argv[1] = mnt;
+
+        tdb = tdb_open(NULL, 10000001, TDB_INTERNAL, O_RDWR, 0);
+        if (tdb == NULL) {
+                printf("Failed to open TDB\n");
+                exit(1);
+        }
+
         return fuse_main(fuse_bgzip_argc, fuse_bgzip_argv, &bgzip_oper, NULL);
 }
