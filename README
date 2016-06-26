@@ -1,0 +1,58 @@
+Fuse-bgzip is a read-only overlay filesystem to transparently uncompress
+indexed GZIP files. This allows access the content of large GZIP files
+without the need to first uncompress them.
+
+(The index file is to make it possible to seek() in the compressed file
+without taking a huge performance hit.)
+
+
+BGZIP
+=====
+BGZIP is a utility to create a special type of GZIP files that are indexed.
+
+
+Compiling
+=========
+gcc -o fuse-bgzip fuse-bgzip.c -lfuse -ltdb -lhts
+
+
+Create an index file
+====================
+bgzip -i foo.bin.ecm
+
+Which will create the two files
+foo.bin.ecm.gz and foo.bin.ecm.gz.gzi
+
+
+Mounting an overlay
+===================
+  fuse-bgzip -m <directory>
+
+
+Unmouning the filesystem
+========================
+  fusermount  -u <directory>
+
+
+Example
+=======
+Assume we have a directory that contains a n indexed file:
+
+  ls -l test
+  total 485548
+  -rw-rw-r-- 1 sahlberg sahlberg 382199471 Oct 24  2007 foo.bin.ecm.gz
+  -rw-rw-r-- 1 sahlberg sahlberg     91337 Oct 24  2007 foo.bin.ecm.gz.gzi
+  -rw-rw-r-- 1 sahlberg sahlberg    132267 Oct 24  2007 foo.bin.ecm.edi
+  -rw-rw-r-- 1 sahlberg sahlberg       114 Oct 24  2007 foo.cue
+
+Then mount fuse-unecm ontop of this directory:
+
+  fuse-bgzip -m test
+
+And the result becomes:
+
+  ls -l test
+  total 485548
+  -rw-rw-r-- 1 sahlberg sahlberg 497190410 Oct 24  2007 foo.bin.ecm
+  -rw-rw-r-- 1 sahlberg sahlberg    132267 Oct 24  2007 foo.bin.ecm.edi
+  -rw-rw-r-- 1 sahlberg sahlberg       114 Oct 24  2007 foo.cue
