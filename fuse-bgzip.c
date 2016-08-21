@@ -39,6 +39,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/vfs.h>
 #include <unistd.h>
 
 #include <htslib/bgzf.h>
@@ -510,12 +511,19 @@ static int fuse_bgzip_release(const char *path, struct fuse_file_info *ffi)
         return 0;
 }
 
+static int fuse_bgzip_statfs(const char *path, struct statvfs* stbuf)
+{
+        return fstatvfs(dir_fd, stbuf);
+}
+
+
 static struct fuse_operations bgzip_oper = {
         .getattr        = fuse_bgzip_getattr,
         .open           = fuse_bgzip_open,
         .release        = fuse_bgzip_release,
         .read           = fuse_bgzip_read,
         .readdir        = fuse_bgzip_readdir,
+        .statfs         = fuse_bgzip_statfs,
 };
 
 static void print_usage(char *name)
@@ -559,7 +567,8 @@ int main(int argc, char *argv[])
         struct passwd *pw = getpwuid(getuid());
         const char *homedir = pw->pw_dir;
         struct stat st;
-        
+        char fs_name[1024], fs_type[1024];
+
         while ((c = getopt_long(argc, argv, "?hal:m:", long_opts,
                     &opt_idx)) > 0) {
                 switch (c) {
@@ -578,6 +587,12 @@ int main(int argc, char *argv[])
                         break;
                 }
         }
+
+        snprintf(fs_name, sizeof(fs_name), "-ofsname=%s", mnt);
+        fuse_bgzip_argv[fuse_bgzip_argc++] = fs_name;
+
+        snprintf(fs_type, sizeof(fs_type), "-osubtype=BGUNZIP");
+        fuse_bgzip_argv[fuse_bgzip_argc++] = fs_type;
 
         if (mnt == NULL) {
                 fprintf(stderr, "-m was not specified.\n");
