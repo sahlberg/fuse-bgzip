@@ -40,6 +40,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/vfs.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <htslib/bgzf.h>
@@ -48,13 +49,16 @@
 
 #define discard_const(ptr) ((void *)((intptr_t)(ptr)))
 
-#define LOG(...) {                          \
-        if (logfile) { \
-            FILE *fh = fopen(logfile, "a+"); \
-            fprintf(fh, "[BGZIP] "); \
-            fprintf(fh, __VA_ARGS__); \
-            fclose(fh); \
-        } \
+#define LOG(...) {                                              \
+        if (logfile) {                                          \
+                FILE *fh = fopen(logfile, "a+");                \
+                time_t t = time(NULL);                          \
+                char tmp[256];                                  \
+                strftime(tmp, sizeof(tmp), "%T", localtime(&t));\
+                fprintf(fh, "[BGZIP] %s ", tmp);                \
+                fprintf(fh, __VA_ARGS__);                       \
+                fclose(fh);                                     \
+        }                                                       \
 }
 
 struct file {
@@ -104,6 +108,7 @@ static int need_bgzip_uncompress(const char *file) {
                 return val;
         }
 
+        LOG("NEED_BGZIP_UNCOMPRESS SLOW PATH [%s]\n", file);
         snprintf(stripped, PATH_MAX,"%s", file);
         if (strlen(stripped) > 4 &&
             !strcmp(stripped + strlen(stripped) - 4, ".gzi")) {
