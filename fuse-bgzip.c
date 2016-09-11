@@ -68,7 +68,8 @@ struct file {
 
 static char *logfile;
 
-static struct tdb_context *tdb;
+static struct tdb_context *nu_tdb;
+static struct tdb_context *filesize_tdb;
 
 /* descriptor for the underlying directory */
 static int dir_fd;
@@ -101,7 +102,7 @@ static int need_bgzip_uncompress(const char *file) {
         LOG("NEED_BGZIP_UNCOMPRESS [%s]\n", file);
         key.dptr = discard_const(file);
         key.dsize = strlen(file);
-        data = tdb_fetch(tdb, key);
+        data = tdb_fetch(nu_tdb, key);
         if (data.dptr) {
                 uint8_t val = data.dptr[0];
                 free(data.dptr);
@@ -137,7 +138,7 @@ static int need_bgzip_uncompress(const char *file) {
 finished:
         data.dptr = &ret;
         data.dsize = 1;
-        tdb_store(tdb, key, data, TDB_REPLACE);
+        tdb_store(nu_tdb, key, data, TDB_REPLACE);
         return ret;
 }
 
@@ -212,48 +213,48 @@ static void load_index_file(BGZF *fh, const char *path)
 /* returns the size of the uncompressed file, or 0 if it could not be
  * determined.
  */
-static off_t get_unzipped_size(const char *path)
+static void get_unzipped_size(const char *path, struct stat *stbuf)
 {
+        TDB_DATA key, data;
+        char file[PATH_MAX+16];
+        char gzfile[PATH_MAX];
         BGZF *fh;
-        char cache[PATH_MAX];
-        char tmp[PATH_MAX];
         char index_file[PATH_MAX];
         int fd;
         off_t pos;
         uint64_t start_pos;
-        ssize_t count;
         char buf[4096];
         const char *ptr;
 
-        /* Create the full path to the cache file. */
+        LOG("GET_UNZIPPED_SIZE [%s]\n", path);
+
         ptr = strrchr(path, '/');
-        if (ptr) {
-                ptr++;
-        } else {
+        if (ptr == NULL) {
                 ptr = path;
         }
-        snprintf(cache, PATH_MAX, "%s/%s.size", cache_path, ptr);
+        snprintf(file, sizeof(file), "%s_%zd", ptr, stbuf->st_size);
 
-        /* Try reading size from cache */
-        fd = open(cache, O_RDONLY);
-        if (fd >= 0) {
-                if (read(fd, &pos, sizeof(pos)) == sizeof(pos)) {
-                        close(fd);
-                        return pos;
-                }
-                close(fd);
+        key.dptr = discard_const(file);
+        key.dsize = strlen(file);
+        data = tdb_fetch(filesize_tdb, key);
+        if (data.dptr) {
+                stbuf->st_size = *(off_t *)data.dptr;
+                free(data.dptr);
+                return;
         }
 
-        snprintf(tmp, PATH_MAX, "%s.gz", path);
-        fd = openat(dir_fd, tmp, O_RDONLY);
+        LOG("GET_UNZIPPED_SIZE SLOW PATH [%s]\n", path);
+
+        snprintf(gzfile, PATH_MAX, "%s.gz", path);
+        fd = openat(dir_fd, gzfile, O_RDONLY);
         if (fd == -1) {
-                return 0;
+                return;
         } 
 
         fh = bgzf_dopen(fd, "ru");
         if (fh == NULL) {
                 close(fd);
-                return 0;
+                return;
         }
         snprintf(index_file, PATH_MAX, "%s.gz.gzi", path);
         load_index_file(fh, index_file);
@@ -281,7 +282,7 @@ static off_t get_unzipped_size(const char *path)
 
         fd = open(index_file, O_RDONLY);
         if (fd == -1) {
-                return 0;
+                return;
         }
         read(fd, &start_pos, sizeof(start_pos));
         start_pos = le64toh(start_pos);
@@ -295,10 +296,12 @@ static off_t get_unzipped_size(const char *path)
 
         /* And start scanning for EOF */
         while (1) {
+                ssize_t count;
+
                 count = bgzf_read(fh, buf, sizeof(buf));
                 if (count < 0) {
                         bgzf_close(fh);
-                        return 0;
+                        return;
                 }
                 if (count == 0) {
                         break;
@@ -308,17 +311,13 @@ static off_t get_unzipped_size(const char *path)
         bgzf_close(fh);
 
         /* Write the size to cache */
-        fd = open(cache, O_CREAT|O_WRONLY, 0600);
-        if (fd == -1) {
-                return pos;
-        }
-        if (write(fd, &pos, sizeof(pos)) != sizeof(pos)) {
-                close(fd);
-                return pos;
-        }
-        close(fd);
-        
-        return pos;
+        stbuf->st_size = pos;
+
+        LOG("GET_UNZIPPED_SIZE [%s] %zu\n", path, stbuf->st_size);
+
+        data.dptr = (uint8_t *)&(stbuf->st_size);
+        data.dsize = sizeof(stbuf->st_size);
+        tdb_store(filesize_tdb, key, data, TDB_REPLACE);
 }
 
 static int fuse_bgzip_getattr(const char *path, struct stat *stbuf)
@@ -342,7 +341,7 @@ static int fuse_bgzip_getattr(const char *path, struct stat *stbuf)
                                 return -errno;
                         }
 
-                        stbuf->st_size = get_unzipped_size(path);
+                        get_unzipped_size(path, stbuf);
                         LOG("GETATTR [%s] SUCCESS\n", path);
                         return 0;
                 }
@@ -543,6 +542,8 @@ int main(int argc, char *argv[])
 {
         int c, ret = 0, opt_idx = 0;
         char *mnt = NULL;
+        char tdbdir[PATH_MAX];
+        char tdbfile[PATH_MAX];
         static struct option long_opts[] = {
                 { "help", no_argument, 0, '?' },
                 { "allow-other", no_argument, 0, 'a' },
@@ -610,19 +611,33 @@ int main(int argc, char *argv[])
                 exit(1);
         }
 
+
         asprintf(&cache_path, "%s/.fuse-bgzip", homedir);
-        if (stat(cache_path, &st) == -1 && errno == ENOENT) {
-                if (mkdir(cache_path, 0700) == -1) {
-                        exit(1);
-                }
-        }
         
         dir_fd = open(mnt, O_DIRECTORY);
         fuse_bgzip_argv[1] = mnt;
 
-        tdb = tdb_open(NULL, 10000001, TDB_INTERNAL, O_RDWR, 0);
-        if (tdb == NULL) {
+        snprintf(tdbdir, sizeof(tdbdir), "%s/.fuse-bgzip",
+                 getpwuid(getuid())->pw_dir);
+        if (stat(tdbdir, &st) == -1 && errno == ENOENT) {
+                if (mkdir(tdbdir, 0700) == -1) {
+                        fprintf(stderr, "failed to create TDB DIR %s %s\n",
+                                tdbdir, strerror(errno));
+                        exit(1);
+                }
+        }
+                
+        nu_tdb = tdb_open(NULL, 10000001, TDB_INTERNAL, O_RDWR, 0);
+        if (nu_tdb == NULL) {
                 printf("Failed to open TDB\n");
+                exit(1);
+        }
+
+        snprintf(tdbfile, sizeof(tdbfile), "%s/file_size.tdb", tdbdir);
+        errno = 0;
+        filesize_tdb = tdb_open(tdbfile, 10000001, 0, O_CREAT|O_RDWR, 0600);
+        if (filesize_tdb == NULL) {
+                printf("Failed to open FILE-SIZE TDB : %s\n", strerror(errno));
                 exit(1);
         }
 
