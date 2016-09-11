@@ -71,11 +71,10 @@ static char *logfile;
 static struct tdb_context *nu_tdb;
 static struct tdb_context *filesize_tdb;
 
+static char *mountpoint;
+
 /* descriptor for the underlying directory */
 static int dir_fd;
-
-/* Absolute path for ~/.fuse-bgzip directory */
-static char *cache_path;
 
 /* This function takes a path to a file and returns true if this needs
  * bgzip unpacking.
@@ -142,72 +141,90 @@ finished:
         return ret;
 }
 
-static void copy_index_file(const char *path)
+/* From bgzf.c */
+typedef struct
 {
-        int in, out, count;
-        char tmp[PATH_MAX];
-        char buf[1024];
-        char *ptr;
-
-        in = openat(dir_fd, path, O_RDONLY);
-        if (in == -1) {
-                return;
-        }
-
-        /* strip any leading directories before we generate the cache file */
-        ptr = strrchr(path, '/');
-        if (ptr) {
-                path = ptr + 1;
-        }
-
-        snprintf(tmp, PATH_MAX, "%s/%s", cache_path, path);
-        out = open(tmp, O_WRONLY|O_CREAT, 0600);
-        if (out == -1) {
-                close(in);
-                return;
-        }
-
-        while (1) {
-                count = read(in, buf, sizeof(buf));
-                if (count < 0) {
-                        close(in);
-                        close(out);
-                        unlink(tmp);
-                        return;
-                }
-                if (count == 0) {
-                        break;
-                }
-                write(out, buf, count);
-        }
-        close(in);
-        close(out);
+    uint64_t uaddr;  // offset w.r.t. uncompressed data
+    uint64_t caddr;  // offset w.r.t. compressed data
 }
+bgzidx1_t;
 
-static void load_index_file(BGZF *fh, const char *path)
+struct __bgzidx_t
+{
+    int noffs, moffs;       // the size of the index, n:used, m:allocated
+    bgzidx1_t *offs;        // offsets
+    uint64_t ublock_addr;   // offset of the current block (uncompressed data)
+};
+
+static uint64_t load_index_file(BGZF *fh, const char *path)
 {
         char tmp[PATH_MAX];
         const char *ptr;
-        int ret;
+        int i, fd, ret;
         struct stat st;
+        uint64_t x;
 
-        /* Create the full path to the index file. */
-        ptr = strrchr(path, '/');
-        if (ptr) {
-                ptr++;
-        } else {
-                ptr = path;
-        }
-        snprintf(tmp, PATH_MAX, "%s/%s", cache_path, ptr);
+        /* The index file consists of
+         * +------------------------------+
+         * |            count             | 8 bytes
+         * +------------------------------+
+         * followed by count + 1 blocks of
+         * +------------------------------+
+         * |      compressed offset       | 8 bytes
+         * +------------------------------+
+         * |      uncompressed offset     | 8 bytes
+         * +------------------------------+
+         * So just reading the last 8 bytes id the index file will
+         * give us a good (and valid) starting offset for finding the EOF and
+         * uncompressed file size.
+         *
+         * The HTSLIB implemnetation of index file always uses native
+         * byteorder. Since that is gross and unportable, I decided to use
+         * little endian.
+         */
 
-        if (stat(tmp, &st) == -1 && errno == ENOENT) {
-                copy_index_file(path);
+        LOG("LOAD_INDEX_FILE [%s]\n", path);
+
+        fd = openat(dir_fd, path, O_RDONLY);
+        if (fd == -1) {
+                return 0;
         }
 
-        ret = bgzf_index_load(fh, tmp, NULL);
-        if (ret == -1) {
-                LOG("LOAD_INDEX_FILE [%s] %s\n", tmp, strerror(errno));
+        fh->idx = malloc(sizeof(struct __bgzidx_t));
+        if (fh->idx == NULL) {
+                close(fd);
+                return 0;
         }
+        memset(fh->idx, 0, sizeof(struct __bgzidx_t));
+
+        read(fd, &x, sizeof(x));
+        x = le64toh(x);
+
+        fh->idx->noffs = x + 1;
+        fh->idx->moffs = x + 1;
+
+        fh->idx->offs = malloc(fh->idx->moffs*sizeof(bgzidx1_t));
+        if (fh->idx->offs == NULL) {
+                close(fd);
+                return 0;
+        }
+
+        fh->idx->offs[0].caddr = 0;
+        fh->idx->offs[0].uaddr = 0;
+        for (i = 1; i < fh->idx->noffs; i++) {
+                read(fd, &x, sizeof(x));
+                x = le64toh(x);
+                fh->idx->offs[i].caddr = x;
+
+                read(fd, &x, sizeof(x));
+                x = le64toh(x);
+                fh->idx->offs[i].uaddr = x;
+        }
+
+        close(fd);
+
+        LOG("LOAD_INDEX_FILE finished [%s]\n", tmp);
+        return x;
 }
 
 /* returns the size of the uncompressed file, or 0 if it could not be
@@ -257,38 +274,7 @@ static void get_unzipped_size(const char *path, struct stat *stbuf)
                 return;
         }
         snprintf(index_file, PATH_MAX, "%s.gz.gzi", path);
-        load_index_file(fh, index_file);
-
-
-        /* Now we need to peek into the index file to find the uncompressed
-         * offset for the final gzip block of the index.
-         *
-         * The index file consists of
-         * +------------------------------+
-         * |            count             | 8 bytes
-         * +------------------------------+
-         * followed by count + 1 blocks of
-         * +------------------------------+
-         * |      compressed offset       | 8 bytes
-         * +------------------------------+
-         * |      uncompressed offset     | 8 bytes
-         * +------------------------------+
-         * So just reading the last 8 bytes id the index file will
-         * give us a good (and valid) starting offset for finding the EOF and
-         * uncompressed file size.
-         */
-        start_pos = 0;
-        snprintf(index_file, PATH_MAX, "%s/%s.gz.gzi", cache_path, ptr);
-
-        fd = open(index_file, O_RDONLY);
-        if (fd == -1) {
-                return;
-        }
-        read(fd, &start_pos, sizeof(start_pos));
-        start_pos = le64toh(start_pos);
-        pread(fd, &start_pos, 8, start_pos * 16);
-        start_pos = le64toh(start_pos);
-        close(fd);
+        start_pos = load_index_file(fh, index_file);
 
         /* Seek to the start of the final gzip block */
         bgzf_useek(fh, start_pos, SEEK_SET);
@@ -443,6 +429,8 @@ static int fuse_bgzip_open(const char *path, struct fuse_file_info *ffi)
         int ret;
         struct file *file = malloc(sizeof(struct file));
 
+        LOG("OPEN [%s]\n", path);
+
         file->fh = NULL;
         file->fd = -1;
 
@@ -541,7 +529,6 @@ static void print_usage(char *name)
 int main(int argc, char *argv[])
 {
         int c, ret = 0, opt_idx = 0;
-        char *mnt = NULL;
         char tdbdir[PATH_MAX];
         char tdbfile[PATH_MAX];
         static struct option long_opts[] = {
@@ -552,14 +539,14 @@ int main(int argc, char *argv[])
                 { "foreground", no_argument, 0, 'f' },
                 { NULL, 0, 0, 0 }
         };
-        int fuse_bgzip_argc = 6;
+        int fuse_bgzip_argc = 5;
         char *fuse_bgzip_argv[16] = {
                 "fuse-bgzip",
                 "<export>",
                 "-omax_write=32768",
                 "-ononempty",
-                "-s",
                 "-odefault_permissions",
+                NULL,
                 NULL,
                 NULL,
                 NULL,
@@ -593,18 +580,18 @@ int main(int argc, char *argv[])
                         logfile = strdup(optarg);
                         break;
                 case 'm':
-                        mnt = strdup(optarg);
+                        mountpoint = strdup(optarg);
                         break;
                 }
         }
 
-        snprintf(fs_name, sizeof(fs_name), "-ofsname=%s", mnt);
+        snprintf(fs_name, sizeof(fs_name), "-ofsname=%s", mountpoint);
         fuse_bgzip_argv[fuse_bgzip_argc++] = fs_name;
 
         snprintf(fs_type, sizeof(fs_type), "-osubtype=BGUNZIP");
         fuse_bgzip_argv[fuse_bgzip_argc++] = fs_type;
 
-        if (mnt == NULL) {
+        if (mountpoint == NULL) {
                 fprintf(stderr, "-m was not specified.\n");
                 print_usage(argv[0]);
                 ret = 10;
@@ -612,10 +599,8 @@ int main(int argc, char *argv[])
         }
 
 
-        asprintf(&cache_path, "%s/.fuse-bgzip", homedir);
-        
-        dir_fd = open(mnt, O_DIRECTORY);
-        fuse_bgzip_argv[1] = mnt;
+        dir_fd = open(mountpoint, O_DIRECTORY);
+        fuse_bgzip_argv[1] = mountpoint;
 
         snprintf(tdbdir, sizeof(tdbdir), "%s/.fuse-bgzip",
                  getpwuid(getuid())->pw_dir);
