@@ -44,6 +44,7 @@
 #include <unistd.h>
 
 #include <htslib/bgzf.h>
+#include <htslib/hfile.h>
 #include <htslib/hts.h>
 #include <tdb.h>
 
@@ -158,11 +159,8 @@ struct __bgzidx_t
 
 static uint64_t load_index_file(BGZF *fh, const char *path)
 {
-        char tmp[PATH_MAX];
-        const char *ptr;
-        int i, fd, ret;
-        struct stat st;
-        uint64_t x;
+        int fd;
+        hFILE *idx;
 
         /* The index file consists of
          * +------------------------------+
@@ -179,8 +177,7 @@ static uint64_t load_index_file(BGZF *fh, const char *path)
          * uncompressed file size.
          *
          * The HTSLIB implemnetation of index file always uses native
-         * byteorder. Since that is gross and unportable, I decided to use
-         * little endian.
+         * byteorder.
          */
 
         LOG("LOAD_INDEX_FILE [%s]\n", path);
@@ -190,41 +187,16 @@ static uint64_t load_index_file(BGZF *fh, const char *path)
                 return 0;
         }
 
-        fh->idx = malloc(sizeof(struct __bgzidx_t));
-        if (fh->idx == NULL) {
-                close(fd);
+        idx = hdopen(fd, "r");
+        if (idx == NULL) {
+                LOG("Failed to hdopen index file\n");
                 return 0;
         }
-        memset(fh->idx, 0, sizeof(struct __bgzidx_t));
+        bgzf_index_load_hfile(fh, idx, "");
+        hclose(idx);
 
-        read(fd, &x, sizeof(x));
-        x = le64toh(x);
-
-        fh->idx->noffs = x + 1;
-        fh->idx->moffs = x + 1;
-
-        fh->idx->offs = malloc(fh->idx->moffs*sizeof(bgzidx1_t));
-        if (fh->idx->offs == NULL) {
-                close(fd);
-                return 0;
-        }
-
-        fh->idx->offs[0].caddr = 0;
-        fh->idx->offs[0].uaddr = 0;
-        for (i = 1; i < fh->idx->noffs; i++) {
-                read(fd, &x, sizeof(x));
-                x = le64toh(x);
-                fh->idx->offs[i].caddr = x;
-
-                read(fd, &x, sizeof(x));
-                x = le64toh(x);
-                fh->idx->offs[i].uaddr = x;
-        }
-
-        close(fd);
-
-        LOG("LOAD_INDEX_FILE finished [%s]\n", tmp);
-        return x;
+        LOG("LOAD_INDEX_FILE finished [%s]\n", path);
+        return fh->idx->offs[fh->idx->noffs - 1].uaddr;
 }
 
 /* returns the size of the uncompressed file, or 0 if it could not be
